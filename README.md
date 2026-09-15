@@ -1,4 +1,4 @@
-# StateQuant
+# CarryKernel
 
 Error-feedback recurrent-state quantization for hybrid (linear-attention) LLMs.
 
