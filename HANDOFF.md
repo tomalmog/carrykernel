@@ -168,10 +168,37 @@ caught them.
 - **Triton `@triton.jit` cannot read plain Python globals** — they must be
   `tl.constexpr` mirrors. Hit this twice (`SOFTPLUS_THRESHOLD`, then
   `RESID_INT4`).
-- **Detached Modal runs:** launching via `nohup modal run --detach ... &` from a
-  shell that then exits appears to get the app cancelled. Launching through the
-  harness's own background mechanism (so the parent stays alive) worked. This is
-  a hypothesis, not verified root cause — the fix sidesteps it either way.
+- **Detached Modal runs get cancelled. Use `modal deploy` + `Function.spawn()`
+  instead.** Two `modal run --detach` attempts were killed mid-run by a
+  cancellation signal — run 1 at ~12 min, run 2 at ~4.7 h (mid-arm-2). Log
+  signature both times:
+
+  ```
+  Received a cancellation signal while processing input (...)
+  Input ... failed to respond to cancellation for too long: 30 seconds - killing task
+  ```
+
+  The first hypothesis (the local launcher parent was reaped) is **refuted**:
+  after the second kill, `ps` showed the `modal run --detach` process still
+  alive, and `modal app list` showed the app `ephemeral (detached)` with 0
+  tasks — the container died, not the app. A fixed timeout is also ruled out by
+  the 12-min vs 4.7-h spread. The only factor both shared was a live client
+  attached to an **ephemeral** app.
+
+  The fix that does not depend on getting the root cause right: deploy the app
+  (persistent, server-side, owned by no client session) and spawn the call.
+  `spawn_int4resid.py` does this. Poll with
+  `modal app logs carrykernel-int4resid`.
+
+- **Long runs are expensive to lose, so size them accordingly.** The bf16 arm is
+  the *only* arm that does no quantization work (`bits=None` returns the state
+  untouched); every EF arm runs a per-V quantize + residual quantize +
+  subtraction per token per GDN layer (24 layers) on a `[1,32,128,128]` tensor
+  in eager PyTorch. Measured: EF arms are ~3x slower than bf16. So 4 arms at 100
+  problems is 4-6 h, not the ~1 h a naive estimate gives. The relaunch uses 50
+  problems/arm (~2-3 h); at n=50 the noise band is about +/-6 points, which is
+  ample for the effects in question (the int8-uniform collapse is 40 points) but
+  too coarse to claim an exact match to baseline.
 - **vLLM's kernel imports from**
   `vllm.third_party.flash_linear_attention.ops.fused_recurrent` (verified on
   vllm 0.29.0, not the `layers/fla/ops/` path some docs show).
