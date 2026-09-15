@@ -99,18 +99,39 @@ recurrent state (24 layers × `[1,32,128,128]`) between decode steps.
 | int5 per-V + EF | 13.09 | +49% |
 | int4 per-V + EF | 27.43 | +212% |
 
-### Broad benchmark (WikiText-2 PPL + GSM8K accuracy, 40 problems)
+### Broad benchmark (GSM8K + MMLU, 100 problems each)
+
+The headline result, on the larger sample (`modal_bench_short.py`, H100):
+
+| scheme | GSM8K | MMLU |
+|---|---|---|
+| bf16 (FP32) | 81.0% (81/100) | 54.0% (54/100) |
+| int8 uniform | **41.0%** (41/100) | 54.0% (54/100) |
+| **int8 per-V + EF** | **81.0%** (81/100) | 54.0% (54/100) |
+| int6 per-V + EF | *(run in progress)* | *(run in progress)* |
+
+**Headline: uniform INT8 drops GSM8K from 81% to 41% (−40 pts); error feedback
++ per-V scaling recovers it completely — 81%, exactly matching the bf16
+baseline.** On the 100-problem sample the recovery is total, not partial as the
+smaller 40-problem run suggested.
+
+MMLU is flat at 54% across all three schemes. That is expected and worth
+stating plainly: MMLU is a single-token multiple-choice task, so it barely
+exercises the recurrent state over a long horizon — it is a control showing the
+quantization does not break general knowledge, not evidence for the method.
+GSM8K, which requires 300–500 tokens of sequential reasoning, is where
+state-quantization error compounds and where the effect appears.
+
+### Earlier 40-problem run (superseded, kept for the WikiText-2 numbers)
 
 | scheme | WikiText-2 PPL | GSM8K acc |
 |---|---|---|
 | bf16 (FP32) | 10.075 | 75.0% (30/40) |
-| int8 uniform | 15.767 | **32.5%** (13/40) |
-| **int8 per-V + EF** | **9.953** | **70.0%** (28/40) |
+| int8 uniform | 15.767 | 32.5% (13/40) |
+| **int8 per-V + EF** | **9.953** | 70.0% (28/40) |
 | int6 per-V + EF | 12.287 | 72.5% (29/40) |
 
-**Headline: uniform INT8 drops GSM8K from 75% to 32.5% (−42.5 pts); error
-feedback + per-V scaling recovers it to 70% (−5 pts).** On WikiText-2, int8
-per-V + EF (9.95) is *below* the bf16 baseline (10.08).
+On WikiText-2, int8 per-V + EF (9.95) is *below* the bf16 baseline (10.08).
 
 ## Finding 5: the residual must be quantized — this sets the real memory win
 
@@ -151,11 +172,74 @@ wall-clock at batch 8 and a *slowdown* at batch 1, because the fused kernel adds
 quantization compute and decode is not purely bandwidth-bound. So the headline
 is a **~2x storage/traffic win**, not a 4x or a 2x speedup.
 
+## Finding 7: a raw CUDA/C++ port — what the hardware actually rewards
+
+The same operation was rewritten as a raw CUDA kernel
+(`cuda/gdn_state_kernel.cu`, ~400 lines, JIT-built through
+`torch.utils.cpp_extension`) and validated against the same oracle. Three
+design decisions were settled by measurement rather than intuition, each
+confirmed with Nsight Compute on an A10G (measured peak HBM: 484 GB/s).
+
+**1. Coalescing dominates everything else.** The obvious decomposition — one
+warp per V-column, walking K inside the warp so `h^T k`, `h^T q` and the amax
+are all warp-shuffle reductions — is the wrong one. The state is `[K, V]`
+row-major, so V is contiguous; assigning a warp to a column makes every lane's
+access K-strided, one sector per lane. Measured: 159 GB/s, 33% of peak.
+
+Assigning one *thread* per V-column instead makes consecutive lanes touch
+consecutive addresses on every load and store, and the K-reduction collapses
+into a per-thread loop with no cross-lane communication at all:
+
+| FP32 baseline | GB/s | % peak | us/token (B=8) |
+|---|---|---|---|
+| warp-per-column (shuffles) | 159 | 33% | 214 |
+| thread-per-column (coalesced) | 318 | 66% | 107 |
+
+**2. Caching the state in registers backfires.** The kernel touches the state
+more than once per step (`read = h^T k` must be fully reduced before `dv`, and
+hence the updated state, is known). Holding each thread's column in a
+`float h_reg[128]` array to avoid re-reading halved the instruction count —
+and ran **2x slower**:
+
+| variant | instructions | dram bytes written | us/token (B=8) |
+|---|---|---|---|
+| multi-pass recompute | 10.21 M | 10.1 MB | 125 |
+| per-thread register cache | 5.53 M | 71.1 MB | 266 |
+
+512 B/thread overflows the register budget, so nvcc spills the array to local
+memory — which is DRAM-backed. Writes went ~7x over the traffic model. On a
+memory-bound kernel, redundant arithmetic is cheaper than spilled traffic.
+
+**3. Triton still wins the INT8 path.** Final comparison (A10G, us/token):
+
+| batch | FP32 CUDA | FP32 Triton | INT8+EF CUDA | INT8+EF Triton |
+|---|---|---|---|---|
+| 1 | **15.4** | 16.0 | 29.1 | 20.4 |
+| 8 | 107.3 | **76.6** | 125.2 | **72.1** |
+| 16 | 215.8 | **152.8** | 204.9 | **139.9** |
+
+The CUDA FP32 baseline beats Triton at batch 1 and reaches 66% of peak
+bandwidth, but Triton's INT8 path is faster at every batch. Nsight says why:
+the INT8 kernel issues 10.2 M instructions against the FP32 baseline's 2.28 M
+at similar traffic, so it is **compute-bound on the quantize/error-feedback
+passes, not memory-bound** — exactly the regime where Triton's scheduling and
+vectorization beat hand-written scalar code. Occupancy is also capped at ~28%
+of peak warps.
+
+This is reported as-is rather than tuned away. The project's claim is a
+storage/traffic reduction, and the roofline is the honest framing: at 2 B/elem
+the INT8 state moves ~1.9x fewer bytes, but the arithmetic added per byte
+pushes the kernel off the bandwidth roof, so the traffic win does not convert
+into a wall-clock win at these shapes.
+
 ## Limitations
 
-- **Small GSM8K sample.** 40 problems (Δ ± ~7 pts). The PPL signals are more
-  stable and point the same direction, but reasoning accuracy should be
-  confirmed on the full set / MMLU.
+- **Moderate GSM8K sample.** 100 problems (Δ ± ~4 pts at these rates), up from
+  40. The direction is stable across both runs and the PPL signals agree, but
+  the full 1319-problem set would tighten it further.
+- **MMLU is uninformative here.** It is flat at 54% across every scheme; a
+  single-token multiple-choice task does not exercise the recurrent state over
+  a long horizon. It supports "nothing broke", not "the method works".
 - **One model family.** Validated on Qwen3.5-4B only; the mechanism (CPU) is
   architecture-agnostic but the end-to-end claim is specific to this model.
 - **Kernel not integrated into vLLM/fla.** The kernel is standalone; a
@@ -165,8 +249,9 @@ is a **~2x storage/traffic win**, not a 4x or a 2x speedup.
 ## Net
 
 Error-feedback recurrent-state quantization rescues INT8 state: it recovers the
-reasoning degradation that DAMP reported (−42.5 GSM8K points → −5), at **~2x
-memory reduction** (int8 state + int8 residual) with ~zero quality cost. The
+reasoning degradation that DAMP reported (−40 GSM8K points → 0, a full return to
+the bf16 baseline on 100 problems), at **~2x memory reduction** (int8 state +
+int8 residual) with ~zero quality cost. The
 mechanism — compounding vs. wash-out as a function of decay rate — resolves the
 DAMP-vs-Minima contradiction, and error feedback (missed by all prior work) is
 the technique that makes it work.

@@ -47,19 +47,29 @@ Final-state error at `t=2000`, `alpha=0.995`:
 | int6 | 0.30 | 0.042 |
 | int8 | 0.074 | 0.010 |
 
-### End-to-end (Qwen3.5-4B, Modal A10G)
+### End-to-end (Qwen3.5-4B)
 
-Broad benchmark (WikiText-2 PPL + GSM8K accuracy, 40 problems):
+GSM8K + MMLU, 100 problems each:
 
-| scheme | WikiText-2 PPL | GSM8K acc |
+| scheme | GSM8K | MMLU |
 |---|---|---|
-| bf16 (FP32) | 10.075 | 75.0% |
-| int8 uniform | 15.767 | 32.5% |
-| **int8 per-V + EF** | **9.953** | **70.0%** |
-| int6 per-V + EF | 12.287 | 72.5% |
+| bf16 (FP32) | 81.0% | 54.0% |
+| int8 uniform | **41.0%** | 54.0% |
+| **int8 per-V + EF** | **81.0%** | 54.0% |
+| int6 per-V + EF | *(running)* | *(running)* |
 
-**Headline: uniform INT8 drops GSM8K 75% → 32.5%; error feedback + per-V
-scaling recovers it to 70%.**
+**Headline: uniform INT8 drops GSM8K 81% → 41%; error feedback + per-V scaling
+recovers it completely, back to the bf16 baseline of 81%.**
+
+MMLU is flat across all schemes — it is a single-token multiple-choice task that
+barely exercises the recurrent state, so it acts as a control (quantization
+doesn't break general knowledge) rather than evidence for the method. GSM8K
+needs 300–500 tokens of sequential reasoning, which is where state-quantization
+error compounds.
+
+On the earlier 40-problem run, WikiText-2 PPL was 10.075 (bf16), 15.767 (int8
+uniform) and 9.953 (int8 per-V + EF) — the EF variant scoring *below* the bf16
+baseline.
 
 ### The real memory win (residual precision matters)
 
@@ -77,11 +87,29 @@ So the honest win is **~2x memory (int8 state + int8 residual) at ~zero quality
 cost** — not "4x free" (pure int8 without error feedback is 4x but drops GSM8K
 to 32.5%).
 
-### Kernel (fused, Triton)
+### Kernel (fused: Triton and raw CUDA/C++)
 
-A fused state-update + INT8 quantize + error-feedback kernel realizes the
-traffic reduction (~1.9x) but only ~1.3x wall-clock at batch 8 (decode isn't
-purely bandwidth-bound). See `RESULTS.md` Finding 6.
+The fused state-update + INT8 quantize + error-feedback op is implemented twice
+— in Triton (`statequant/kernel.py`) and in raw CUDA/C++
+(`cuda/gdn_state_kernel.cu`) — both validated against the same oracle. The
+traffic reduction is real (~1.9x); the wall-clock gain is modest (~1.3x at
+batch 8), because decode here is not purely bandwidth-bound.
+
+Three findings from the CUDA port, each settled by Nsight measurement (A10G,
+484 GB/s measured peak):
+
+- **Coalescing dominates.** One thread per V-column (V is the contiguous axis)
+  instead of one warp per column took the FP32 baseline from 33% to 66% of peak
+  bandwidth, 214 → 107 us/token at batch 8.
+- **Register caching backfires.** Holding each thread's column in a
+  `float[128]` halved the instruction count but ran 2x slower: nvcc spills it to
+  local memory, and DRAM writes went 10.1 → 71.1 MB. Recompute beats spilled
+  traffic.
+- **Triton still wins the INT8 path** (72 vs 125 us/token at batch 8). The INT8
+  kernel is compute-bound on the quantize passes — 10.2M instructions vs the
+  FP32 baseline's 2.28M at similar traffic — not memory-bound.
+
+See `RESULTS.md` Findings 6 and 7.
 
 ## Reproduce
 

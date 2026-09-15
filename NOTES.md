@@ -29,15 +29,25 @@ Error feedback = ~1.5–2 bits effective precision for free. Per-channel
 | int6 per-V + EF | 10.74 (+22%) |
 | int4 per-V + EF | 27.43 (+212%) |
 
-### Broad benchmark (WikiText-2 PPL + GSM8K, 40 problems)
+### Broad benchmark (GSM8K + MMLU, 100 problems each) — CURRENT
+| scheme | GSM8K | MMLU |
+|---|---|---|
+| bf16 | 81/100 (81.0%) | 54/100 (54.0%) |
+| int8 uniform | 41/100 (41.0%) | 54/100 (54.0%) |
+| int8 per-V + EF | 81/100 (81.0%) | 54/100 (54.0%) |
+| int6 per-V + EF | (run in progress) | (run in progress) |
+
+Uniform INT8 loses 40 GSM8K points; EF recovers ALL of them (back to the bf16
+baseline exactly). MMLU flat across schemes — single-token multiple choice
+barely exercises the recurrent state, so it is a control, not evidence.
+
+### Earlier 40-problem run (superseded; source of the WikiText-2 numbers)
 | scheme | WikiText2 | GSM8K |
 |---|---|---|
 | bf16 | 10.075 | 75.0% |
 | int8 uniform | 15.767 | 32.5% |
 | int8 per-V + EF | 9.953 | 70.0% |
 | int6 per-V + EF | 12.287 | 72.5% |
-
-Uniform INT8 loses 42.5 GSM8K points; EF recovers 37.5 of them.
 
 ### Residual precision (forced-decode PPL, int8 state)
 | residual | PPL | vs bf16 | memory vs FP32 |
@@ -61,8 +71,32 @@ int8 residual is sufficient → **~2x memory at ~0% quality**.
 Traffic reduction ~1.9x, wall-clock ~1.3x at batch 8 (slowdown at batch 1).
 Key bug fixed: round-half-to-even vs round-half-away drifted the residual.
 
+### Kernel (raw CUDA/C++, A10G, measured peak 484 GB/s)
+us/token, CUDA vs Triton:
+
+| batch | FP32 CUDA | FP32 Triton | INT8+EF CUDA | INT8+EF Triton |
+|---|---|---|---|---|
+| 1 | **15.4** | 16.0 | 29.1 | 20.4 |
+| 8 | 107.3 | **76.6** | 125.2 | **72.1** |
+| 16 | 215.8 | **152.8** | 204.9 | **139.9** |
+
+Three measured design findings (Nsight):
+1. Coalescing dominates: thread-per-V-column (V contiguous) vs warp-per-column
+   took FP32 from 159 -> 318 GB/s (33% -> 66% peak), 214 -> 107 us at B=8.
+2. Register-caching the column (`float h_reg[128]`) halved instructions
+   (10.21M -> 5.53M) but was 2x SLOWER: nvcc spilled to local memory,
+   dram writes 10.1 -> 71.1 MB. Recompute beats spilled traffic.
+3. Triton wins the INT8 path. It is compute-bound on the quantize passes
+   (10.2M inst vs 2.28M for FP32 at similar traffic), not memory-bound.
+   Occupancy caps at ~28% of peak warps.
+
+CUDA wins the FP32 baseline and batch 1; Triton wins INT8 everywhere.
+Reported as-is: the claim is traffic/storage, not speedup.
+
 ## Bottom line
-Error-feedback recurrent-state quantization rescues INT8 state (GSM8K 32.5%→70%)
-at ~2x memory reduction. Novel vs DAMP/DeltaLog/Minima (none used EF on the
-recurrent state). Modest speedup (~1.3x), so position as a quantization-method
-contribution, not a "4x kernel".
+Error-feedback recurrent-state quantization rescues INT8 state (GSM8K 41%→81%
+on 100 problems, a full recovery to the bf16 baseline) at ~2x memory reduction.
+Novel vs DAMP/DeltaLog/Minima (none used EF on the recurrent state). No
+wall-clock speedup to speak of (~1.3x at batch 8, and the CUDA INT8 path is
+compute-bound), so position as a quantization-method contribution, not a
+"4x kernel".

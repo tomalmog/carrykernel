@@ -124,21 +124,28 @@ a quantization-method contribution, not a "fast kernel."
 ```
 statequant/
   reference.py        # exact GDN recurrence (bit-comparable to fla), + validate_reference()
-  quantize.py         # uniform / per-channel / block quantizers + ErrorFeedback
+  quant.py            # uniform / per-channel / block quantizers + ErrorFeedback
   kernel.py           # fused Triton state-update + INT8 quantize + EF (has torch-reference)
+cuda/
+  gdn_state_kernel.cu # raw CUDA/C++ port of the same fused op (+ FP32 baseline)
+  binding.py          # JIT build (torch.utils.cpp_extension) + Python wrapper
 experiments/
   exp1_error_dynamics.py  # compounding vs wash-out (mechanism)
   exp2_bits_sweep.py      # INT-k floor + EF
   exp2b_granularity.py    # granularity × EF
-  test_kernel.py          # kernel torch-reference vs oracle (PASSES, 0.0 err)
+  test_kernel.py          # Triton kernel torch-reference vs oracle (PASSES, 0.0 err)
+  test_cuda_kernel.py     # CUDA kernel vs oracle / Triton, all residual formats
   kernel_bench.py         # fused-kernel bandwidth benchmark
+  cuda_bench.py           # CUDA vs Triton vs FP32, batch 1/8/16 + roofline
 modal_smoke.py        # load model, find the state hook (diagnostic)
 modal_eval.py         # end-to-end INT8 result (forced-decode PPL)
 modal_bench.py        # WikiText-2 + GSM8K (40-problem; the WORKING extraction is here)
 modal_bench_short.py  # 100-problem version w/ progress (currently running)
 modal_residual.py     # residual-precision sweep
 modal_fullbench.py    # full 1319-problem GSM8K (excessive; don't use)
-modal_kernel.py       # kernel benchmark on GPU
+modal_kernel.py       # Triton kernel benchmark on GPU
+modal_cuda.py         # CUDA kernel: correctness + benchmark (needs a CUDA-devel image)
+modal_nsight.py       # Nsight Compute profiling of the CUDA kernel
 modal_diag.py         # quick 3-problem diagnostic
 README.md             # overview + results (title is "CarryKernel")
 RESULTS.md            # the full paper-style writeup (landing doc)
@@ -196,9 +203,13 @@ python experiments/test_kernel.py
 - ✅ Error-feedback technique + per-channel scaling (CPU + GPU).
 - ✅ End-to-end Qwen3.5-4B: forced-decode PPL, WikiText-2, GSM8K (40), residual-precision.
 - ✅ Fused Triton kernel (correct, benchmarked).
+- ✅ **Raw CUDA/C++ kernel** (correct vs oracle + Triton, benchmarked at batch
+  1/8/16, Nsight-profiled). See RESULTS.md Finding 7. Honest outcome: CUDA wins
+  the FP32 baseline and batch 1; Triton still wins the INT8 path because that
+  path is compute-bound on the quantize passes, not memory-bound.
 - ✅ Docs finalized (README, RESULTS, NOTES).
-- ✅ Repo pushed to github.com/tomalmog/carrykernel (2 commits).
-- 🔄 Full-ish benchmark (100 GSM8K + 100 MMLU × 4 schemes) running in background.
+- 🔄 Full-ish benchmark (100 GSM8K + 100 MMLU × 4 schemes): 3 of 4 schemes done
+  (bf16 81/54, int8 41/54, int8-V+EF 81/54); int6-V+EF still running.
 
 ## What's left / next steps (in priority order)
 
@@ -206,35 +217,44 @@ python experiments/test_kernel.py
    `carrykernel-bench` detached). Update `RESULTS.md` / `README.md` / `NOTES.md`
    with the final GSM8K (100) + MMLU (100) table, and push.
 
-2. **NEXT STEP (the author explicitly wants this): write the fused kernel in
-   CUDA/C++.** The current kernel is Triton (`statequant/kernel.py`). Rewrite the
-   same operation (state update + INT8 quantize + error feedback) as a raw CUDA
-   kernel (.cu + a small Python extension or ctypes/numba wrapper), and:
-   - Verify correctness against `statequant/reference.py` (the oracle).
-   - Benchmark it on Modal (A10G/H100) against the FP32 and Triton baselines.
-   - The goal is to demonstrate CUDA/C++ memory-hierarchy/warp-programming skill
-     for the target roles — NOT necessarily a big speedup (the workload is
-     memory-bound; expect similar or marginally better numbers than Triton).
-   - Key things to show: shared-memory tiling of the [K,V] state, warp-level
-     reduction for `h^T k`, the per-V-channel scale, the round-half-to-even
-     quantization + residual, and an Nsight/roofline note.
-   - Commit and push to the existing repo (add to `statequant/` or a new
-     `cuda/` dir). Update README + resume bullet to say "CUDA" not "Triton".
+2. ✅ **DONE — the CUDA/C++ kernel.** `cuda/gdn_state_kernel.cu` + `cuda/binding.py`
+   (JIT via `torch.utils.cpp_extension`; needs an `nvidia/cuda:*-devel` image
+   because the pip torch wheel ships no `nvcc`). Verified against the oracle and
+   against Triton for all four residual formats; benchmarked at batch 1/8/16;
+   Nsight-profiled. Read RESULTS.md Finding 7 before touching it — the three
+   design findings there were each settled by measurement, and two of them
+   contradict the obvious approach (warp-per-column and register-caching are
+   both *worse*).
 
-3. **Resume update** — the current 3-point entry (see below) should say
-   "CUDA/C++" after step 2. Keep it result-first, ~1 line per bullet.
+3. **vLLM integration (in scope, next big step).** Research done — key facts:
+   vLLM vendors fla at `vllm/third_party/flash_linear_attention/ops/fused_recurrent.py`;
+   the GDN decode kernel is `fused_recurrent_gated_delta_rule_packed_decode`.
+   **vLLM's state is `[V, K]` — transposed from our `[K, V]`**, so the port is
+   not copy-paste (our per-V amax reduces over K, which is the contiguous axis
+   there). Gates to extend: `FUSED_GDN_STATE_DTYPES` and
+   `_fused_gdn_decode_unsupported_reason()` in
+   `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py`; `MambaDType`
+   in `vllm/config/cache.py` rejects int8 today. vLLM RFC #55196 proposes exactly
+   this and is blocked on the accuracy evidence this project already has.
+   Hard part: the EF residual is per-request persistent state that must survive
+   paging, preemption, prefix-cache reuse and spec-decode rollback.
+   Caveat: hybrids use a uniform page size, so shrinking only the Mamba page may
+   not give proportional concurrency gains — measure `page_size_bytes` AND the
+   logged max concurrency, and report both.
+
+4. **Resume update** — the entry below now says "CUDA/C++". Keep it result-first.
 
 ## Resume entry (current draft)
 
 ```
-CarryKernel — Error-Feedback Recurrent-State Quantization (Python + PyTorch + Triton)  [GitHub]
+CarryKernel — Error-Feedback Recurrent-State Quantization (CUDA/C++ + Triton + PyTorch)  [GitHub]
 - Achieved 2× memory reduction at zero quality cost in hybrid-LLM serving by applying error feedback to recurrent-state quantization.
-- Restored 37.5 GSM8K accuracy points lost to INT8 state quantization (32.5% → 70%), resolving the DAMP vs. Minima contradiction.
-- Wrote a fused Triton kernel for the quantized state update with error feedback, benchmarked against an FP32 baseline.
+- Restored 40 GSM8K accuracy points lost to INT8 state quantization (41% → 81%, matching the bf16 baseline), resolving the DAMP vs. Minima contradiction.
+- Wrote the fused quantized state update in raw CUDA/C++ and Triton; Nsight-guided memory-coalescing rework doubled the baseline kernel's bandwidth (33% → 66% of peak).
 ```
 
-(After the CUDA step: change "Triton" → "CUDA/C++" in both the header and the
-third bullet.)
+(The GSM8K numbers above are the 100-problem run. Update the third bullet if the
+kernel is retuned.)
 
 ## Prior art (the four papers to cite / compare against)
 
