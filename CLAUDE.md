@@ -240,9 +240,8 @@ they run from the repo root as written — no `PYTHONPATH=.` needed.)
 
 ## What's left / next steps (in priority order)
 
-1. **Collect the running benchmark numbers** (app in `modal app list`, look for
-   `carrykernel-bench` detached). Update `RESULTS.md` / `README.md` / `NOTES.md`
-   with the final GSM8K (100) + MMLU (100) table, and push.
+1. ✅ **DONE — the 100-problem benchmark.** All four schemes finished and are
+   folded into `RESULTS.md` / `README.md` / `NOTES.md` (see the table above).
 
 2. ✅ **DONE — the CUDA/C++ kernel.** `cuda/gdn_state_kernel.cu` + `cuda/binding.py`
    (JIT via `torch.utils.cpp_extension`; needs an `nvidia/cuda:*-devel` image
@@ -253,35 +252,52 @@ they run from the repo root as written — no `PYTHONPATH=.` needed.)
    contradict the obvious approach (warp-per-column and register-caching are
    both *worse*).
 
-3. **vLLM integration (in scope, next big step).** Research done — key facts:
-   vLLM vendors fla at `vllm/third_party/flash_linear_attention/ops/fused_recurrent.py`;
-   the GDN decode kernel is `fused_recurrent_gated_delta_rule_packed_decode`.
-   **vLLM's state is `[V, K]` — transposed from our `[K, V]`**, so the port is
-   not copy-paste (our per-V amax reduces over K, which is the contiguous axis
-   there). Gates to extend: `FUSED_GDN_STATE_DTYPES` and
-   `_fused_gdn_decode_unsupported_reason()` in
-   `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py`; `MambaDType`
-   in `vllm/config/cache.py` rejects int8 today. vLLM RFC #55196 proposes exactly
-   this and is blocked on the accuracy evidence this project already has.
-   Hard part: the EF residual is per-request persistent state that must survive
-   paging, preemption, prefix-cache reuse and spec-decode rollback.
-   Caveat: hybrids use a uniform page size, so shrinking only the Mamba page may
-   not give proportional concurrency gains — measure `page_size_bytes` AND the
-   logged max concurrency, and report both.
+3. ✅ **DONE — vLLM Stage A.** `vllm_integration/quantized_packed_decode.py`:
+   a quantized drop-in for vLLM's vendored
+   `fused_recurrent_gated_delta_rule_packed_decode`, written against its exact
+   contract (the `[num_slots, HV, V, K]` pool with K contiguous, paged
+   `ssm_state_indices`, `NULL_BLOCK_ID` padding). The `[V, K]` transpose turned
+   out favourable: `BK = next_pow2(K)` with `NK == 1` means one program holds a
+   whole `[BV, K]` tile, so the per-V amax is an in-register contiguous
+   reduction — no multi-pass. Both int8 and int4-packed residuals implemented
+   and tested. See RESULTS.md Finding 8.
 
-4. **Resume update** — the entry below now says "CUDA/C++". Keep it result-first.
+4. **What is genuinely left, in priority order.**
+   - **Stage B (vLLM cache wiring)** — extend `MambaDType`, thread the scale +
+     residual through `MambaSpec`, relax `FUSED_GDN_STATE_DTYPES`. Only worth
+     doing with the **int4** residual (int8 is 0.97x vs bf16, i.e. a loss). The
+     hard part is that the EF residual is per-request persistent state that must
+     survive paging, preemption, prefix-cache reuse and spec-decode rollback.
+     Also note hybrids use a uniform page size, so shrinking only the Mamba page
+     may not give proportional concurrency gains — measure `page_size_bytes`
+     AND the logged max concurrency, and report both.
+   - **End-to-end int4-residual quality run** — the 100-problem GSM8K/MMLU
+     benchmark was run with an fp32 residual. The int4 residual has kernel-level
+     error numbers and an older PPL data point (+1.6%), but no GSM8K run.
+   - **Second model** (Qwen3.5-9B) for generality.
+   - **Tune the CUDA INT8 path** — it is compute-bound on the quantize passes
+     (10.2M instructions vs 2.28M for FP32); Triton still beats it.
+
+   **Scope constraint (author, 2026-09-15): no upstream PRs, no open-sourcing
+   beyond this repo.** Pushing to tomalmog/carrykernel is fine; contributing to
+   vLLM/fla, or commenting on RFC #55196, is not.
 
 ## Resume entry (current draft)
 
 ```
 CarryKernel — Error-Feedback Recurrent-State Quantization (CUDA/C++ + Triton + PyTorch)  [GitHub]
-- Achieved 2× memory reduction at zero quality cost in hybrid-LLM serving by applying error feedback to recurrent-state quantization.
-- Restored 40 GSM8K accuracy points lost to INT8 state quantization (41% → 81%, matching the bf16 baseline), resolving the DAMP vs. Minima contradiction.
+- Restored 40 GSM8K accuracy points lost to INT8 recurrent-state quantization in a hybrid LLM (41% → 81%, matching the bf16 baseline) by applying error feedback, resolving the DAMP vs. Minima contradiction.
 - Wrote the fused quantized state update in raw CUDA/C++ and Triton; Nsight-guided memory-coalescing rework doubled the baseline kernel's bandwidth (33% → 66% of peak).
+- Ported the kernel to vLLM's paged GDN state layout, cutting recurrent-state memory 1.28× against vLLM's bf16 default via an int4-packed error-feedback residual.
 ```
 
-(The GSM8K numbers above are the 100-problem run. Update the third bullet if the
-kernel is retuned.)
+Notes for future edits of this entry:
+- **Always attach the baseline to a memory number.** "2× memory reduction" is
+  true only against FP32; against bf16 (what vLLM actually defaults to) the
+  int8-residual scheme is 0.97×, and only the int4 residual wins at 1.28×. A
+  bare "2×" would not survive an interviewer asking "compared to what?".
+- The GSM8K figures are the 100-problem run with an fp32 residual.
+- Drop the third bullet if the vLLM work is not something to discuss.
 
 ## Prior art (the four papers to cite / compare against)
 
