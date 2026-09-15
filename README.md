@@ -85,7 +85,25 @@ negates the saving. Quantizing the residual fixes it:
 
 So the honest win is **~2x memory (int8 state + int8 residual) at ~zero quality
 cost** — not "4x free" (pure int8 without error feedback is 4x but drops GSM8K
-to 32.5%).
+to 41%).
+
+### The baseline matters: 2x vs FP32, break-even vs bf16
+
+That 2x is measured against an **FP32** state. Serving engines don't necessarily
+store it that way — vLLM's GDN state defaults to the model activation dtype,
+which is bf16 for Qwen3.5. Since `int8 state + int8 residual` costs 2 B/element,
+exactly what bf16 costs, the comparison changes completely:
+
+| state representation | bytes/slot | vs FP32 | vs bf16 |
+|---|---|---|---|
+| fp32 | 2.10 MB | 1.00x | — |
+| bf16 | 1.05 MB | 2.00x | 1.00x |
+| int8 + int8 residual + scales | 1.08 MB | **1.94x** | **0.97x** |
+
+Against bf16 this scheme is marginally *worse* on memory. The quality result is
+unaffected — INT8 state at bf16-level accuracy is still the contribution — but
+an in-engine memory win needs a cheaper residual (int4, or amortizing one
+residual across steps). See `RESULTS.md` Finding 8.
 
 ### Kernel (fused: Triton and raw CUDA/C++)
 

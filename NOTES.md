@@ -93,6 +93,24 @@ Three measured design findings (Nsight):
 CUDA wins the FP32 baseline and batch 1; Triton wins INT8 everywhere.
 Reported as-is: the claim is traffic/storage, not speedup.
 
+### vLLM-layout kernel (Stage A) + the bf16 caveat
+Ported to vLLM's [num_slots, HV, V, K] layout (K contiguous) against the
+vendored `fused_recurrent_gated_delta_rule_packed_decode` contract. Verified on
+A10G: rounding (124 ties, 60 discriminating), NULL_BLOCK_ID padding, paging
+isolation, decode vs oracle (o rel 1.7e-3, h rel 5.3e-3).
+
+Layout transpose is FAVOURABLE: BK = next_pow2(K), NK == 1 means one program
+holds a whole [BV, K] tile, so the per-V amax is an in-register contiguous
+row reduction — no multi-pass, unlike the [K, V] CUDA kernel.
+
+**Bytes/slot (HV=32, V=K=128): fp32 2.10 MB | bf16 1.05 MB | int8+EF 1.08 MB.**
+=> 1.94x vs fp32, **0.97x vs bf16**. vLLM's GDN state defaults to the model
+activation dtype (bf16 for Qwen3.5), so against the REAL baseline this scheme is
+break-even-to-slightly-worse on memory. int8 state + int8 residual = 2 B/elem,
+exactly bf16's cost. An in-engine win needs int4 residual (~1.33x vs bf16) or
+amortizing one residual across steps. Stage B (cache wiring) deliberately NOT
+done for this reason.
+
 ## Bottom line
 Error-feedback recurrent-state quantization rescues INT8 state (GSM8K 41%→81%
 on 100 problems, a full recovery to the bf16 baseline) at ~2x memory reduction.

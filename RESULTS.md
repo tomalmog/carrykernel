@@ -232,6 +232,49 @@ the INT8 state moves ~1.9x fewer bytes, but the arithmetic added per byte
 pushes the kernel off the bandwidth roof, so the traffic win does not convert
 into a wall-clock win at these shapes.
 
+## Finding 8: in a real engine the 2x is measured against FP32, not bf16
+
+The kernel was ported a second time, into the layout vLLM actually uses
+(`vllm_integration/quantized_packed_decode.py`), against the contract of its
+vendored GDN decode kernel `fused_recurrent_gated_delta_rule_packed_decode`.
+
+**The layout transpose is favourable.** vLLM stores the recurrent state as
+`[num_slots, HV, V, K]` with K contiguous, where this project uses `[K, V]`.
+Since the vendored kernel forces `BK = next_pow2(K)` with `NK == 1`, one program
+instance holds a complete `[BV, K]` tile — so the per-V-channel `amax` becomes a
+row-wise reduction along contiguous memory, resolved **in registers inside a
+single program**. No cross-program reduction, no atomics, no second pass. This
+is exactly the constraint that forced the multi-pass design in the CUDA kernel
+(Finding 7).
+
+Verified on A10G against the same oracle, plus the engine behaviours the layout
+brings with it: round-half-to-even (124 constructed ties, 60 discriminating
+against `floor(x+0.5)`, zero code differences), `NULL_BLOCK_ID` padding (emits
+zeros, leaves other slots byte-identical), paging isolation (batched ==
+per-request sequential), and decode-vs-oracle at `o rel 1.7e-3 / h rel 5.3e-3`.
+
+**And the caveat that matters most.** The ~2x memory claim is against an **FP32**
+state. vLLM's GDN state dtype defaults to the model activation dtype — bf16 for
+Qwen3.5 — and `int8 state + int8 residual` is 2 B/element, which is exactly what
+bf16 already costs. Bytes per request slot at Qwen3.5 shapes (HV=32, V=K=128):
+
+| state representation | bytes/slot | vs FP32 | vs bf16 |
+|---|---|---|---|
+| fp32 | 2.10 MB | 1.00x | — |
+| bf16 | 1.05 MB | 2.00x | 1.00x |
+| int8 + int8 residual + scales | 1.08 MB | **1.94x** | **0.97x** |
+
+So against the baseline a real vLLM deployment actually runs, error-feedback
+INT8 is **marginally worse on memory**, not 2x better. The quality result stands
+on its own (INT8 state at bf16-level accuracy), but a memory win in-engine needs
+a cheaper residual — int4 (2.67x vs FP32, ~1.33x vs bf16), or amortizing one
+residual across several steps. `test_memory_claim` asserts both directions so
+the claim cannot silently drift.
+
+This is why Stage B (wiring into vLLM's cache allocation) is **not** worth doing
+as-is: it would land a change that does not reduce memory against the real
+baseline.
+
 ## Limitations
 
 - **Moderate GSM8K sample.** 100 problems (Δ ± ~4 pts at these rates), up from
@@ -242,9 +285,14 @@ into a wall-clock win at these shapes.
   a long horizon. It supports "nothing broke", not "the method works".
 - **One model family.** Validated on Qwen3.5-4B only; the mechanism (CPU) is
   architecture-agnostic but the end-to-end claim is specific to this model.
-- **Kernel not integrated into vLLM/fla.** The kernel is standalone; a
-  production integration (storing packed int8 + scales in the cache) is
-  engineering work, not done here.
+- **Kernel not integrated into vLLM/fla.** A vLLM-layout kernel exists and is
+  correctness-tested (Finding 8), but it is standalone: nothing is wired into
+  vLLM's cache allocation. Deliberately so — against vLLM's real bf16 default
+  the current scheme is 0.97x on memory, so the integration would not deliver
+  the win it advertises until the residual gets cheaper.
+- **The memory claim is baseline-dependent.** 2x is against FP32; against bf16
+  it is break-even. Every memory number in this document should be read with
+  its baseline attached.
 
 ## Net
 
