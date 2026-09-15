@@ -105,8 +105,12 @@ exactly what bf16 costs, the comparison changes completely:
 
 With an int8 residual the scheme is 2 B/element — exactly bf16's cost, so
 marginally *worse* than the baseline a real engine runs. Packing the residual to
-int4 (two codes per byte) fixes that: **1.28x against bf16**, measured, at a
-decode error still on the quantization noise floor. See `RESULTS.md` Finding 8.
+int4 (two codes per byte) fixes that: **1.28x against bf16**, measured.
+
+That int4 residual also costs no detectable quality end-to-end (GSM8K, 50
+problems, all arms in one run): bf16 76%, int4 residual 74%, int8 residual 76%
+— a two-problem spread inside the ±6-point band at n=50. See `RESULTS.md`
+Finding 8.
 
 ### Kernel (fused: Triton and raw CUDA/C++)
 

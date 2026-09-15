@@ -11,27 +11,24 @@ covers **today's work, today's mistakes, and what is in flight right now**.
 **Repo:** `tomalmog/carrykernel`, branch `main`, HEAD `89270c1`, working tree
 clean, everything pushed.
 
-**In flight:** one detached Modal run, `ap-zannS2bQXczvMFDLCHdqEB`
-(`carrykernel-int4resid`, H100, started 10:08 EDT). Monitor task `b2ciisj9p` is
-armed on it and notifies on each `RESULT` line, on per-50 progress, and on any
-termination (cancellation / kill / app stopped).
+**In flight:** nothing. The int4-residual benchmark completed on the deployed
+app `carrykernel-int4resid` (50 problems/arm, all four arms):
 
-First arm has landed:
+| scheme | GSM8K | vs bf16 | MMLU |
+|---|---|---|---|
+| bf16 | 38/50 (76%) | — | 24/50 (48%) |
+| int8-V+EF fp32 residual | 36/50 (72%) | −2 | 24/50 (48%) |
+| int8-V+EF int8 residual | 38/50 (76%) | 0 | 24/50 (48%) |
+| **int8-V+EF int4 residual** | **37/50 (74%)** | **−1** | 24/50 (48%) |
 
-```
-RESULT bf16   GSM8K=82/100 (0.820)   MMLU=54/100 (0.540)
-```
+**int4 holds** — no detectable quality cost, two-problem spread across all arms.
+This closes the last open gap: the 1.28x-vs-bf16 memory win now has a downstream
+quality number, not just a kernel-level error figure.
 
-Three arms remain: `int8-V+EF fp32resid`, `int8-V+EF int8resid`,
-`int8-V+EF int4resid`. Roughly 10–15 min per arm.
-
-**Note on 82 vs 81.** The earlier 100-problem run scored bf16 at 81/100; this
-one scores 82/100 on the same 100 problems. Same model, same greedy decoding —
-the difference is that this harness quantizes nothing on the bf16 arm but
-reaches the model through a freshly installed hook, and small numerical /
-kernel-path differences move one problem. Treat ±1–2 problems as run-to-run
-noise at n=100, and read the int4 arm against **this run's own** bf16 (82), not
-against the older 81.
+Read every arm against **this run's own** bf16 (76%), never against the 81–82%
+of the 100-problem runs. That difference is sampling: it is the same first 50
+problems, and the 100-problem runs also scored 38/50 at their 50-problem
+checkpoint. The first half of GSM8K is harder than the second.
 
 ---
 
@@ -46,8 +43,10 @@ against the older 81.
 | int4-packed residual | `e1bee61`, `4da518f` | Done, 1.28x vs bf16 |
 | Repro commands fixed | `a5f8d43` | Done |
 | Handoff + resume updated | `6bf5fd2` | Done |
-| int4 quality harness | `36f2008` | Done, **running** |
-| Head-to-head vs vLLM's real kernel | `89270c1` | Done |
+| int4 quality harness | `36f2008` | Done |
+| Head-to-head vs vLLM's real kernel | `89270c1` | Done, parity within ~5% |
+| Deploy+spawn launch fix | `bc86a85` | Done, after two runs were killed |
+| int4 residual quality (50/arm) | this commit | Done, **int4 holds** |
 
 ---
 
@@ -57,6 +56,19 @@ This split matters more than any individual number. The user pushed hard on it
 and was right to.
 
 ### 3a. Externally anchored — these are the real results
+
+**Residual precision, end-to-end** (Qwen3.5-4B, 50 problems/arm, all arms in one
+run — read each against this run's own bf16):
+
+| scheme | GSM8K | vs bf16 | MMLU |
+|---|---|---|---|
+| bf16 | 38/50 (76%) | — | 24/50 (48%) |
+| int8-V+EF fp32 residual | 36/50 (72%) | −2 | 24/50 (48%) |
+| int8-V+EF int8 residual | 38/50 (76%) | 0 | 24/50 (48%) |
+| **int8-V+EF int4 residual** | **37/50 (74%)** | **−1** | 24/50 (48%) |
+
+int4 costs no detectable quality. n=50 gives a ±6-point band — enough to rule
+out collapse, not enough to claim an exact match to baseline.
 
 **Quality** (Qwen3.5-4B, H100, 100 problems each; baseline is the unquantized
 model; runs through a `DynamicCache.update_recurrent_state` hook, **no kernel of
@@ -222,8 +234,9 @@ vllm_integration/
 modal_cuda.py                      CUDA correctness + benchmark (needs devel image)
 modal_nsight.py                    Nsight Compute profiling
 modal_vllm_stage_a.py              vLLM-layout kernel correctness
-modal_bench_int4resid.py           int4-residual quality benchmark  <- RUNNING
+modal_bench_int4resid.py           int4-residual quality benchmark
 modal_vllm_headtohead.py           ours vs vLLM's production kernel
+spawn_int4resid.py                 deploy + spawn launcher (see section 5)
 HANDOFF.md                         this file
 ```
 
@@ -231,16 +244,12 @@ HANDOFF.md                         this file
 
 ## 7. What is left
 
-1. **Finish the int4 quality run** (in flight). Then fold the four-arm table into
-   `RESULTS.md` / `README.md` / `NOTES.md` and push. **This is the only open
-   item from the current thread.**
-   - If int4 holds at ~82%: the project has parity-speed, 22%-less-traffic, and
-     no quality cost. That is the complete story.
-   - If int4 costs real accuracy: say so plainly. The in-engine memory win
-     collapses to int8-only (0.97x vs bf16, i.e. nothing), while the quality and
-     mechanism results survive untouched.
+**Nothing from the current thread is open.** The int4 quality run finished and
+is folded into `RESULTS.md`, `README.md` and `NOTES.md`. The complete story:
+parity with vLLM's production kernel, 22% less state traffic, 1.28x less state
+memory than vLLM's bf16 default, and no detectable quality cost.
 
-2. **Optional, none blocking:**
+1. **Optional, none blocking:**
    - Second model (Qwen3.5-9B) for generality — currently one model family.
    - Tune the CUDA INT8 path; it is compute-bound on the quantize passes
      (10.2M instructions vs 2.28M for FP32) and loses to Triton.
@@ -248,6 +257,9 @@ HANDOFF.md                         this file
      residual. The hard part is that the EF residual is per-request persistent
      state that must survive paging, preemption, prefix-cache reuse and
      spec-decode rollback.
+   - Re-run the residual comparison at n=100+ if an exact-match-to-baseline
+     claim is ever needed. n=50 establishes that int4 does not collapse; it
+     cannot establish that int4 exactly equals baseline.
 
 3. **User's scope constraint (2026-09-15), still in force:** no upstream PRs, no
    open-sourcing beyond this repo. Pushing to `tomalmog/carrykernel` is fine.

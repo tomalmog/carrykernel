@@ -120,6 +120,20 @@ variant that wins (1.28x vs bf16)** — implemented, nibble packing verified
 lossless, decode error o 2.8e-3 / h 6.6e-3 vs 1.7e-3 / 5.3e-3 for int8.
 Any Stage B cache wiring must use the int4 residual.
 
+### Residual precision, end-to-end (GSM8K + MMLU, 50 each, one run)
+| scheme | GSM8K | vs bf16 | MMLU |
+|---|---|---|---|
+| bf16 | 38/50 (76%) | — | 24/50 |
+| int8-V+EF fp32 resid | 36/50 (72%) | -2 | 24/50 |
+| int8-V+EF int8 resid | 38/50 (76%) | 0 | 24/50 |
+| int8-V+EF int4 resid | 37/50 (74%) | -1 | 24/50 |
+
+int4 residual costs no detectable quality: 2-problem spread across all arms,
+inside the +/-6-point band at n=50. Sized to detect the 40-point int8-uniform
+collapse, NOT to prove an exact match to baseline.
+76% vs the 81-82% of the 100-problem runs is sampling (same first 50 problems;
+those runs also read 38/50 at their 50-problem checkpoint), not regression.
+
 ## Bottom line
 Error-feedback recurrent-state quantization rescues INT8 state (GSM8K 41%→81%
 on 100 problems, a full recovery to the bf16 baseline; int6+EF matches it too)

@@ -284,6 +284,35 @@ error against the oracle moves from `o 1.7e-3 / h 5.3e-3` (int8 residual) to
 `o 2.8e-3 / h 6.6e-3` (int4), still at the INT8 quantization noise floor, and
 the project's PPL sweep independently put an int4 residual at +1.6%.
 
+### End-to-end quality of the residual precisions (GSM8K + MMLU, 50 each)
+
+Kernel-level error is not a downstream quality claim, so the residual
+precisions were also run end-to-end on Qwen3.5-4B
+(`modal_bench_int4resid.py`). All four arms in one run, so each is read
+against this run's own baseline:
+
+| scheme | GSM8K | vs bf16 | MMLU |
+|---|---|---|---|
+| bf16 | 38/50 (76%) | — | 24/50 (48%) |
+| int8-V + EF, fp32 residual | 36/50 (72%) | −2 | 24/50 (48%) |
+| int8-V + EF, int8 residual | 38/50 (76%) | 0 | 24/50 (48%) |
+| **int8-V + EF, int4 residual** | **37/50 (74%)** | **−1** | 24/50 (48%) |
+
+**The int4 residual costs no detectable quality.** It lands one problem below
+baseline, the int8 residual matches baseline exactly, and the total spread
+across all four arms is two problems.
+
+Two caveats, both load-bearing:
+
+- **n=50 gives roughly a ±6-point band.** This run establishes that int4 does
+  not collapse; it is too coarse to claim int4 *exactly* matches baseline. The
+  effects it was sized to detect (the 40-point int8-uniform collapse) are far
+  outside that band.
+- **76% here vs 81–82% in the 100-problem runs is sampling, not regression.**
+  It is the same first 50 problems, and the 100-problem runs also scored 38/50
+  at their own 50-problem checkpoint — the first half of GSM8K is simply
+  harder. Always compare an arm to the baseline from its own run.
+
 `test_memory_claim` asserts **both** directions — the int8 residual must *not*
 claim a win over bf16, and the int4 residual must — so neither claim can
 silently drift.
