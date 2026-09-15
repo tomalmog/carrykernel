@@ -18,7 +18,12 @@ The honest total is the sum.  fp32 residual is *worse* than the fp32 baseline
 (10 vs 8 B/elem); fp16 is ~25% less; fp8/int8 is ~2x less.
 """
 
+import os
+import sys
+
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from statequant import kernel
 

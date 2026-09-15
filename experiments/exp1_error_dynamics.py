@@ -13,6 +13,11 @@ failure mode is real; then block-scaling / error-feedback must rescue it.
 
 import torch
 
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from statequant.reference import gdn_decode_batched, gdn_step_batched
 from statequant.quant import uniform_quantize, blockscale_quantize, ErrorFeedback
 

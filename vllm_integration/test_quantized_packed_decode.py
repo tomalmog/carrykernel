@@ -19,7 +19,12 @@ Checks:
 Run on Modal (needs a GPU + Triton):  modal run modal_vllm_stage_a.py
 """
 
+import os
+import sys
+
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from statequant.quant import ErrorFeedback, per_axis_quantize
 from statequant.reference import gdn_step_batched

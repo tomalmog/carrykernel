@@ -8,6 +8,11 @@ across int3..int8.
 
 import torch
 
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from statequant.reference import gdn_step_batched, gdn_decode_batched
 from statequant.quant import uniform_quantize, per_axis_quantize, blockscale_quantize, ErrorFeedback
 

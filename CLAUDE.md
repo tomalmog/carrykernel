@@ -64,15 +64,22 @@ is mediocre for state.
 | int6 per-V + EF | 10.74 (+22%) |
 | int4 per-V + EF | 27.43 (+212%) |
 
-### Broad benchmark (WikiText-2 PPL + GSM8K, 40 problems — full run in progress)
-| scheme | WikiText2 PPL | GSM8K |
+### Broad benchmark (GSM8K + MMLU, 100 problems each) — FINAL
+| scheme | GSM8K | MMLU |
 |---|---|---|
-| bf16 | 10.075 | 75.0% |
-| int8 uniform | 15.767 | 32.5% |
-| int8 per-V + EF | 9.953 | 70.0% |
-| int6 per-V + EF | 12.287 | 72.5% |
+| bf16 | 81/100 (81.0%) | 54/100 (54.0%) |
+| int8 uniform | 41/100 (41.0%) | 54/100 (54.0%) |
+| int8 per-V + EF | 81/100 (81.0%) | 54/100 (54.0%) |
+| int6 per-V + EF | 81/100 (81.0%) | 54/100 (54.0%) |
 
-Headline: uniform INT8 loses 42.5 GSM8K points; EF recovers 37.5 of them.
+Headline: uniform INT8 loses 40 GSM8K points; EF recovers ALL of them. int6+EF
+matches bf16 too, so 6-bit state with EF beats 8-bit without it at 25% less
+storage. MMLU is flat across schemes — a control (single-token multiple choice
+barely exercises the recurrent state), not evidence.
+
+The earlier 40-problem run (superseded; still the source of the WikiText-2 PPL
+numbers): bf16 10.075 / 75.0%, int8 uniform 15.767 / 32.5%,
+int8 per-V+EF 9.953 / 70.0%, int6 per-V+EF 12.287 / 72.5%.
 
 ### Residual precision (int8 state + EF, forced-decode PPL)
 The residual must be quantized too, or it negates the memory saving.
@@ -165,6 +172,9 @@ python experiments/exp2b_granularity.py
 python -c "from statequant.reference import validate_reference; assert validate_reference()"
 python experiments/test_kernel.py
 ```
+
+(The `experiments/` scripts insert the repo root on `sys.path` themselves, so
+they run from the repo root as written — no `PYTHONPATH=.` needed.)
 
 ## Infra / budget (Modal)
 

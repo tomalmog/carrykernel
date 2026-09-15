@@ -15,7 +15,12 @@ Requires a CUDA GPU with a working nvcc (run it on Modal via
   4. round-half-to-even is exact at .5 boundaries
 """
 
+import os
+import sys
+
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from statequant import kernel as tk
 from statequant.quant import ErrorFeedback, per_axis_quantize

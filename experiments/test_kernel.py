@@ -9,7 +9,12 @@ also validates the Triton kernel against the torch reference, for every residual
 precision (fp32 / fp16 / fp8 / int8).
 """
 
+import os
+import sys
+
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from statequant.reference import gdn_step_batched
 from statequant.quant import ErrorFeedback, per_axis_quantize, uniform_quantize

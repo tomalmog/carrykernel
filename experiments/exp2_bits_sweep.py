@@ -7,6 +7,11 @@ scaling (DAMP's "high-risk channel" intuition) vs. per-head uniform.
 
 import torch
 
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from statequant.reference import gdn_decode_batched, gdn_step_batched
 from statequant.quant import uniform_quantize, ErrorFeedback
 

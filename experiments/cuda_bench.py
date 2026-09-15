@@ -10,7 +10,12 @@ counts are directly comparable. This workload is memory-bound: the point is that
 INT8+EF moves ~2x fewer bytes, not that the kernel is dramatically faster.
 """
 
+import os
+import sys
+
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from statequant import kernel as tk
 from cuda import binding
