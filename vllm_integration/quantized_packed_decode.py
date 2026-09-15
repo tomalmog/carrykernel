@@ -71,17 +71,26 @@ except ImportError:  # pragma: no cover - CPU-only hosts
     HAS_TRITON = False
 
 QMAX_INT8 = 127.0
+QMAX_INT4 = 7.0
 EPS = 1e-12
 SOFTPLUS_THRESHOLD = 20.0
 NULL_BLOCK_ID = 0
+
+# Residual precision. int8 costs 1 B/element, which makes the whole scheme
+# 2 B/element -- exactly bf16's cost, so it is break-even against vLLM's real
+# default. int4 packs two codes per byte for 1.5 B/element, an actual win.
+RESID_INT8 = 0
+RESID_INT4 = 1
 
 
 if HAS_TRITON:
     # Triton kernels can only read globals declared as tl.constexpr, so the
     # host-side constants above are mirrored here for use inside @triton.jit.
     _QMAX = tl.constexpr(QMAX_INT8)
+    _QMAX4 = tl.constexpr(QMAX_INT4)
     _EPS = tl.constexpr(EPS)
     _SOFTPLUS_THRESHOLD = tl.constexpr(SOFTPLUS_THRESHOLD)
+    _RESID_INT4 = tl.constexpr(RESID_INT4)
 
     @triton.jit
     def _round_half_to_even(x):
@@ -97,11 +106,12 @@ if HAS_TRITON:
         state_codes, state_scale, resid_codes, resid_scale,
         out, ssm_state_indices,
         stride_mixed_qkv_tok, stride_a_tok, stride_b_tok,
-        stride_state_slot, stride_scale_slot, stride_indices_seq,
+        stride_state_slot, stride_resid_slot, stride_scale_slot, stride_indices_seq,
         H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
         BK: tl.constexpr, BV: tl.constexpr,
         USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
         SPLIT_BATCH_HEAD_GRID: tl.constexpr,
+        RESID_FMT: tl.constexpr,
     ):
         if SPLIT_BATCH_HEAD_GRID:
             i_v, i_hv, i_n = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -128,8 +138,15 @@ if HAS_TRITON:
         # --- state pointers: [slot, HV, V, K], K contiguous ---
         p_state = (state_codes + state_idx * stride_state_slot
                    + i_hv * V * K + o_v[:, None] * K + o_k[None, :])
-        p_resid = (resid_codes + state_idx * stride_state_slot
-                   + i_hv * V * K + o_v[:, None] * K + o_k[None, :])
+        # int4 residuals pack two codes per byte along K, so the row is half as
+        # wide and each element needs a nibble select.
+        if RESID_FMT == _RESID_INT4:
+            o_kb = o_k // 2
+            p_resid = (resid_codes + state_idx * stride_resid_slot
+                       + i_hv * V * (K // 2) + o_v[:, None] * (K // 2) + o_kb[None, :])
+        else:
+            p_resid = (resid_codes + state_idx * stride_resid_slot
+                       + i_hv * V * K + o_v[:, None] * K + o_k[None, :])
         # one scale per V-row
         p_sscale = state_scale + state_idx * stride_scale_slot + i_hv * V + o_v
         p_rscale = resid_scale + state_idx * stride_scale_slot + i_hv * V + o_v
@@ -175,7 +192,14 @@ if HAS_TRITON:
         # --- error feedback + requantization ---
         # The whole [BV, K] tile is resident, so amax over K is an in-register
         # row reduction: one scale per V-row, no cross-program communication.
-        b_e = tl.load(p_resid, mask=mask_h, other=0).to(tl.float32) * b_rscale[:, None]
+        if RESID_FMT == _RESID_INT4:
+            packed = tl.load(p_resid, mask=mask_h, other=0).to(tl.int32) & 0xFF
+            # low nibble for even K, high nibble for odd K; sign-extend from 4 bits
+            nib = tl.where((o_k[None, :] % 2) == 0, packed & 0xF, (packed >> 4) & 0xF)
+            nib = tl.where(nib > 7, nib - 16, nib)
+            b_e = nib.to(tl.float32) * b_rscale[:, None]
+        else:
+            b_e = tl.load(p_resid, mask=mask_h, other=0).to(tl.float32) * b_rscale[:, None]
         target = b_h + b_e
 
         amax = tl.max(tl.abs(target), 1)                    # [BV]
@@ -184,15 +208,35 @@ if HAS_TRITON:
         codes = tl.minimum(tl.maximum(codes, -_QMAX), _QMAX)
         e_new = target - codes * s_new[:, None]
 
+        e_qmax = _QMAX4 if RESID_FMT == _RESID_INT4 else _QMAX
         e_amax = tl.max(tl.abs(e_new), 1)
-        es_new = tl.maximum(e_amax / _QMAX, _EPS)
+        es_new = tl.maximum(e_amax / e_qmax, _EPS)
         e_codes = _round_half_to_even(e_new / es_new[:, None])
-        e_codes = tl.minimum(tl.maximum(e_codes, -_QMAX), _QMAX)
+        e_codes = tl.minimum(tl.maximum(e_codes, -e_qmax), e_qmax)
 
         tl.store(p_state, codes.to(tl.int8), mask=mask_h)
-        tl.store(p_resid, e_codes.to(tl.int8), mask=mask_h)
         tl.store(p_sscale, s_new, mask=mask_v)
         tl.store(p_rscale, es_new, mask=mask_v)
+
+        if RESID_FMT == _RESID_INT4:
+            # Repack pairs of nibbles. Each byte is written once, by the even-K
+            # lane, which reads its odd partner's code via a shifted load of the
+            # same register tile -- so no cross-lane traffic and no read-modify-
+            # write race between the two halves of a byte.
+            ec = e_codes.to(tl.int32) & 0xF
+            lo = tl.where((o_k[None, :] % 2) == 0, ec, 0)
+            hi = tl.where((o_k[None, :] % 2) == 1, ec << 4, 0)
+            # sum adjacent K pairs: reshape [BV, K] -> [BV, K//2, 2] and reduce
+            byte_vals = tl.sum(tl.reshape(lo + hi, (BV, K // 2, 2)), 2)
+            o_kb2 = tl.arange(0, BK // 2)
+            mask_kb = o_kb2 < (K // 2)
+            p_resid_w = (resid_codes + state_idx * stride_resid_slot
+                         + i_hv * V * (K // 2) + o_v[:, None] * (K // 2)
+                         + o_kb2[None, :])
+            tl.store(p_resid_w, byte_vals.to(tl.int8),
+                     mask=mask_v[:, None] & mask_kb[None, :])
+        else:
+            tl.store(p_resid, e_codes.to(tl.int8), mask=mask_h)
 
 
 def quantized_gated_delta_rule_packed_decode(
@@ -209,6 +253,7 @@ def quantized_gated_delta_rule_packed_decode(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
+    resid_fmt: int = RESID_INT8,
 ):
     """INT8 + error-feedback drop-in for ``fused_recurrent_gated_delta_rule_packed_decode``.
 
@@ -229,7 +274,13 @@ def quantized_gated_delta_rule_packed_decode(
     if state_codes.stride(-1) != 1:
         raise ValueError("state_codes must be contiguous in its last dimension")
     if state_codes.dtype != torch.int8 or resid_codes.dtype != torch.int8:
-        raise ValueError("state_codes and resid_codes must be int8")
+        raise ValueError("state_codes and resid_codes must be int8 storage")
+    if resid_fmt == RESID_INT4 and resid_codes.shape[-1] * 2 != state_codes.shape[-1]:
+        raise ValueError(
+            "int4 residual must be packed two codes per byte: expected last dim "
+            f"{state_codes.shape[-1] // 2}, got {resid_codes.shape[-1]}")
+    if resid_fmt == RESID_INT8 and resid_codes.shape != state_codes.shape:
+        raise ValueError("int8 residual must have the same shape as the state")
     if ssm_state_indices.dim() != 1:
         raise ValueError("ssm_state_indices must be 1-D")
     if ssm_state_indices.dtype != torch.int32:
@@ -252,6 +303,8 @@ def quantized_gated_delta_rule_packed_decode(
     BK = triton.next_power_of_2(K)
     if triton.cdiv(K, BK) != 1:
         raise ValueError(f"packed decode only supports NK=1 (K={K}, BK={BK})")
+    if resid_fmt == RESID_INT4 and K % 2 != 0:
+        raise ValueError(f"int4 residual packing needs an even K, got {K}")
     BV = min(triton.next_power_of_2(V), 32)
     NV = triton.cdiv(V, BV)
 
@@ -263,26 +316,32 @@ def quantized_gated_delta_rule_packed_decode(
         state_codes, state_scale, resid_codes, resid_scale,
         out, ssm_state_indices,
         mixed_qkv.stride(0), a.stride(0), b.stride(0),
-        state_codes.stride(0), state_scale.stride(0), ssm_state_indices.stride(0),
+        state_codes.stride(0), resid_codes.stride(0), state_scale.stride(0),
+        ssm_state_indices.stride(0),
         H=H, HV=HV, K=K, V=V, BK=BK, BV=BV,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         SPLIT_BATCH_HEAD_GRID=split,
+        RESID_FMT=resid_fmt,
         num_warps=1, num_stages=3,
     )
     return out
 
 
 def init_quantized_state(num_slots: int, HV: int, V: int, K: int, device,
-                         h0: torch.Tensor | None = None):
+                         h0: torch.Tensor | None = None,
+                         resid_fmt: int = RESID_INT8):
     """Allocate the quantized state pool, optionally seeding slot contents.
 
     ``h0``, when given, is ``[num_slots, HV, V, K]`` fp32 and is quantized into
     the pool; the residual starts at zero. Returns
-    ``(state_codes, state_scale, resid_codes, resid_scale)``.
+    ``(state_codes, state_scale, resid_codes, resid_scale)``. With
+    ``resid_fmt=RESID_INT4`` the residual is packed two codes per byte, so its
+    last dimension is ``K // 2``.
     """
+    resid_k = K // 2 if resid_fmt == RESID_INT4 else K
     state_codes = torch.zeros((num_slots, HV, V, K), dtype=torch.int8, device=device)
     state_scale = torch.zeros((num_slots, HV, V), dtype=torch.float32, device=device)
-    resid_codes = torch.zeros((num_slots, HV, V, K), dtype=torch.int8, device=device)
+    resid_codes = torch.zeros((num_slots, HV, V, resid_k), dtype=torch.int8, device=device)
     resid_scale = torch.zeros((num_slots, HV, V), dtype=torch.float32, device=device)
 
     if h0 is not None:
@@ -294,15 +353,17 @@ def init_quantized_state(num_slots: int, HV: int, V: int, K: int, device,
 
 
 def state_bytes_per_slot(HV: int, V: int, K: int, quantized: bool,
-                         base_dtype_size: int = 4):
+                         base_dtype_size: int = 4, resid_fmt: int = RESID_INT8):
     """Bytes of recurrent state per request slot, for the memory claim.
 
-    This mirrors what vLLM's ``MambaSpec.page_size_bytes`` computes, and is the
-    number the 2x claim rests on -- deterministic, not a benchmark.
+    Mirrors what vLLM's ``MambaSpec.page_size_bytes`` computes -- deterministic,
+    not a benchmark. Note the baseline matters: an int8 state with an int8
+    residual is 2 B/element, exactly bf16's cost, so it only beats an FP32
+    baseline. The int4 residual (1.5 B/element) is what beats bf16.
     """
     if not quantized:
         return HV * V * K * base_dtype_size
-    codes = HV * V * K            # int8 state
-    resid = HV * V * K            # int8 residual
-    scales = 2 * HV * V * 4       # fp32 state + residual scales
+    codes = HV * V * K                                    # int8 state
+    resid = HV * V * (K // 2 if resid_fmt == RESID_INT4 else K)
+    scales = 2 * HV * V * 4                               # fp32 state + resid scales
     return codes + resid + scales

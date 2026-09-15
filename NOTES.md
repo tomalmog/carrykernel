@@ -35,11 +35,13 @@ Error feedback = ~1.5–2 bits effective precision for free. Per-channel
 | bf16 | 81/100 (81.0%) | 54/100 (54.0%) |
 | int8 uniform | 41/100 (41.0%) | 54/100 (54.0%) |
 | int8 per-V + EF | 81/100 (81.0%) | 54/100 (54.0%) |
-| int6 per-V + EF | (run in progress) | (run in progress) |
+| int6 per-V + EF | 81/100 (81.0%) | 54/100 (54.0%) |
 
 Uniform INT8 loses 40 GSM8K points; EF recovers ALL of them (back to the bf16
-baseline exactly). MMLU flat across schemes — single-token multiple choice
-barely exercises the recurrent state, so it is a control, not evidence.
+baseline exactly). int6+EF ALSO hits 81% — 6-bit state with EF beats 8-bit
+without it, at 25% less storage. The bit width isn't the variable; EF is.
+MMLU flat across schemes — single-token multiple choice barely exercises the
+recurrent state, so it is a control, not evidence.
 
 ### Earlier 40-problem run (superseded; source of the WikiText-2 numbers)
 | scheme | WikiText2 | GSM8K |
@@ -113,7 +115,8 @@ done for this reason.
 
 ## Bottom line
 Error-feedback recurrent-state quantization rescues INT8 state (GSM8K 41%→81%
-on 100 problems, a full recovery to the bf16 baseline) at ~2x memory reduction.
+on 100 problems, a full recovery to the bf16 baseline; int6+EF matches it too)
+at ~2x memory reduction **vs FP32** (break-even vs bf16 — see the caveat above).
 Novel vs DAMP/DeltaLog/Minima (none used EF on the recurrent state). No
 wall-clock speedup to speak of (~1.3x at batch 8, and the CUDA INT8 path is
 compute-bound), so position as a quantization-method contribution, not a

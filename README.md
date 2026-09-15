@@ -56,10 +56,12 @@ GSM8K + MMLU, 100 problems each:
 | bf16 (FP32) | 81.0% | 54.0% |
 | int8 uniform | **41.0%** | 54.0% |
 | **int8 per-V + EF** | **81.0%** | 54.0% |
-| int6 per-V + EF | *(running)* | *(running)* |
+| **int6 per-V + EF** | **81.0%** | 54.0% |
 
 **Headline: uniform INT8 drops GSM8K 81% → 41%; error feedback + per-V scaling
-recovers it completely, back to the bf16 baseline of 81%.**
+recovers it completely, back to the bf16 baseline of 81%.** int6 + EF also
+reaches 81% — so 6-bit state with error feedback beats 8-bit state without it,
+at 25% less storage. The bit width is not what matters; the error feedback is.
 
 MMLU is flat across all schemes — it is a single-token multiple-choice task that
 barely exercises the recurrent state, so it acts as a control (quantization

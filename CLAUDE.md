@@ -208,8 +208,16 @@ python experiments/test_kernel.py
   the FP32 baseline and batch 1; Triton still wins the INT8 path because that
   path is compute-bound on the quantize passes, not memory-bound.
 - ✅ Docs finalized (README, RESULTS, NOTES).
-- 🔄 Full-ish benchmark (100 GSM8K + 100 MMLU × 4 schemes): 3 of 4 schemes done
-  (bf16 81/54, int8 41/54, int8-V+EF 81/54); int6-V+EF still running.
+- ✅ Full-ish benchmark (100 GSM8K + 100 MMLU × 4 schemes) COMPLETE:
+  bf16 81/54, int8 uniform 41/54, int8-V+EF 81/54, int6-V+EF 81/54.
+  Both EF variants match the bf16 baseline exactly; int6+EF beats int8-without-EF
+  at 25% less storage.
+- ✅ **vLLM Stage A**: a quantized drop-in for vLLM's vendored GDN decode kernel
+  in its own [V,K] layout, correctness-tested (rounding ties, NULL_BLOCK_ID
+  padding, paging isolation, decode-vs-oracle). **Key caveat: the 2x memory
+  claim is vs FP32; vLLM defaults the GDN state to bf16, against which int8
+  state + int8 residual is 0.97x. The int4-residual variant (~1.33x vs bf16) is
+  what actually wins.** See RESULTS.md Finding 8.
 
 ## What's left / next steps (in priority order)
 

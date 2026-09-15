@@ -108,12 +108,18 @@ The headline result, on the larger sample (`modal_bench_short.py`, H100):
 | bf16 (FP32) | 81.0% (81/100) | 54.0% (54/100) |
 | int8 uniform | **41.0%** (41/100) | 54.0% (54/100) |
 | **int8 per-V + EF** | **81.0%** (81/100) | 54.0% (54/100) |
-| int6 per-V + EF | *(run in progress)* | *(run in progress)* |
+| **int6 per-V + EF** | **81.0%** (81/100) | 54.0% (54/100) |
 
 **Headline: uniform INT8 drops GSM8K from 81% to 41% (−40 pts); error feedback
 + per-V scaling recovers it completely — 81%, exactly matching the bf16
 baseline.** On the 100-problem sample the recovery is total, not partial as the
 smaller 40-problem run suggested.
+
+**int6 + EF also lands on 81%**, i.e. 6-bit recurrent state is equally lossless
+on this benchmark once error feedback is applied — strictly better than int8
+*without* it (41%) at 25% less state. That is the clearest statement of the
+central claim: what makes low-bit state work is the error feedback, not the bit
+width.
 
 MMLU is flat at 54% across all three schemes. That is expected and worth
 stating plainly: MMLU is a single-token multiple-choice task, so it barely

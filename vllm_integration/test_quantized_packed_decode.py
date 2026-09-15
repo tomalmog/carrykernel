@@ -284,14 +284,102 @@ def test_round_half_to_even(device, H=1, HV=1, K=32, V=4):
 def test_memory_claim(HV=32, V=128, K=128):
     fp32 = qpd.state_bytes_per_slot(HV, V, K, quantized=False, base_dtype_size=4)
     bf16 = qpd.state_bytes_per_slot(HV, V, K, quantized=False, base_dtype_size=2)
-    q8 = qpd.state_bytes_per_slot(HV, V, K, quantized=True)
-    print(f"  bytes/slot: fp32={fp32/1e6:.2f} MB  bf16={bf16/1e6:.2f} MB  "
-          f"int8+EF={q8/1e6:.2f} MB")
-    print(f"  reduction vs fp32: {fp32/q8:.2f}x   vs bf16: {bf16/q8:.2f}x")
-    # int8 state + int8 residual + two fp32 per-V scale vectors
+    q8 = qpd.state_bytes_per_slot(HV, V, K, quantized=True, resid_fmt=qpd.RESID_INT8)
+    q4 = qpd.state_bytes_per_slot(HV, V, K, quantized=True, resid_fmt=qpd.RESID_INT4)
+    print(f"  bytes/slot: fp32={fp32/1e6:.2f} MB  bf16={bf16/1e6:.2f} MB")
+    print(f"              int8 resid={q8/1e6:.2f} MB  int4 resid={q4/1e6:.2f} MB")
+    print(f"  int8 resid: {fp32/q8:.2f}x vs fp32, {bf16/q8:.2f}x vs bf16")
+    print(f"  int4 resid: {fp32/q4:.2f}x vs fp32, {bf16/q4:.2f}x vs bf16")
+
+    # int8 state + int8 residual + two fp32 per-V scale vectors = 2 B/elem,
+    # exactly bf16's cost -- a win only against FP32.
     assert 1.9 < fp32 / q8 < 2.05, f"expected ~2x vs fp32, got {fp32/q8:.3f}"
-    # Honest: against a bf16 baseline it is roughly break-even, not a win.
-    assert bf16 / q8 < 1.1, "should not claim a win against bf16"
+    assert bf16 / q8 < 1.1, "int8 residual must not claim a win against bf16"
+
+    # int4 residual is 1.5 B/elem: this is the variant that actually beats the
+    # baseline a real vLLM deployment runs.
+    assert 2.5 < fp32 / q4 < 2.75, f"expected ~2.67x vs fp32, got {fp32/q4:.3f}"
+    assert bf16 / q4 > 1.25, f"int4 residual should beat bf16, got {bf16/q4:.3f}x"
+
+
+def test_int4_residual_vs_oracle(device, B=1, H=8, HV=16, K=64, V=64, T=32):
+    """int4-packed residual: decode must still track the oracle.
+
+    The residual is a correction term, so coarsening it to 4 bits is expected to
+    track the oracle slightly less tightly than int8 -- but it must stay at the
+    quantization noise floor, not drift.
+    """
+    num_slots = B + 1
+    scale = K ** -0.5
+    h0 = torch.randn(B, HV, V, K, device=device) * 0.1
+    pool = torch.zeros(num_slots, HV, V, K, device=device)
+    pool[1:] = h0
+
+    sc, ss, rc, rs = qpd.init_quantized_state(
+        num_slots, HV, V, K, device, h0=pool, resid_fmt=qpd.RESID_INT4)
+    assert rc.shape[-1] == K // 2, f"int4 residual should be packed: {rc.shape}"
+    indices = torch.arange(1, B + 1, dtype=torch.int32, device=device)
+
+    steps = [make_packed_inputs(B, H, HV, K, V, device, seed=300 + t) for t in range(T)]
+    out = torch.empty(B, 1, HV, V, device=device)
+    kernel_outs = []
+    for (mixed, a, b, A_log, dt_bias) in steps:
+        qpd.quantized_gated_delta_rule_packed_decode(
+            mixed, a, b, A_log, dt_bias, scale, sc, ss, rc, rs, out, indices,
+            use_qk_l2norm_in_kernel=True, resid_fmt=qpd.RESID_INT4)
+        torch.cuda.synchronize()
+        kernel_outs.append(out[:, 0].clone())
+    kernel_o = torch.stack(kernel_outs)
+
+    c0, s0 = quantize_vk(pool[1:])
+    h0_deq = c0.float() * s0[..., None]
+
+    max_o_rel = max_h_rel = 0.0
+    for r in range(B):
+        per_req = [(m[r:r+1], a[r:r+1], b[r:r+1], A, d)
+                   for (m, a, b, A, d) in steps]
+        o_ref, h_ref = oracle_decode_vk(h0_deq[r], per_req, H, scale, True)
+        h_got = sc[r + 1].float() * ss[r + 1][..., None]
+        max_o_rel = max(max_o_rel, rel(kernel_o[:, r], o_ref))
+        max_h_rel = max(max_h_rel, rel(h_got, h_ref))
+
+    print(f"  int4 resid decode T={T} B={B} vs oracle:  "
+          f"o rel={max_o_rel:.3e}  h rel={max_h_rel:.3e}")
+    assert max_o_rel < 8e-2, f"int4 residual output drifted: {max_o_rel}"
+    assert max_h_rel < 8e-2, f"int4 residual state drifted: {max_h_rel}"
+
+
+def test_int4_packing_roundtrip(device, H=4, HV=4, K=32, V=8):
+    """The nibble pack/unpack must be lossless for in-range int4 codes.
+
+    Runs one step, reads the packed bytes back, and checks that every unpacked
+    nibble is a valid signed 4-bit code -- this is what catches a pack that puts
+    the two halves of a byte in the wrong lanes.
+    """
+    scale = K ** -0.5
+    pool = torch.randn(2, HV, V, K, device=device) * 0.1
+    sc, ss, rc, rs = qpd.init_quantized_state(
+        2, HV, V, K, device, h0=pool, resid_fmt=qpd.RESID_INT4)
+    indices = torch.tensor([1], dtype=torch.int32, device=device)
+    mixed, a, b, A_log, dt_bias = make_packed_inputs(1, H, HV, K, V, device, seed=5)
+    out = torch.empty(1, 1, HV, V, device=device)
+
+    qpd.quantized_gated_delta_rule_packed_decode(
+        mixed, a, b, A_log, dt_bias, scale, sc, ss, rc, rs, out, indices,
+        resid_fmt=qpd.RESID_INT4)
+    torch.cuda.synchronize()
+
+    packed = rc[1].to(torch.int32) & 0xFF                  # [HV, V, K//2]
+    lo = packed & 0xF
+    hi = (packed >> 4) & 0xF
+    lo = torch.where(lo > 7, lo - 16, lo)
+    hi = torch.where(hi > 7, hi - 16, hi)
+    assert int(lo.abs().max()) <= 7, f"low nibble out of int4 range: {int(lo.abs().max())}"
+    assert int(hi.abs().max()) <= 7, f"high nibble out of int4 range: {int(hi.abs().max())}"
+    # a non-trivial residual must actually have been written
+    assert int(lo.abs().sum()) + int(hi.abs().sum()) > 0, "residual is all zeros"
+    print(f"  int4 packing: nibbles in range, "
+          f"{int((lo != 0).sum()) + int((hi != 0).sum())} non-zero codes  OK")
 
 
 def main():
@@ -313,6 +401,10 @@ def main():
     print("\n=== INT8+EF decode vs reference.py oracle ([V,K] layout) ===")
     test_decode_vs_oracle(device, B=1)
     test_decode_vs_oracle(device, B=4, T=16)
+
+    print("\n=== int4-packed residual ===")
+    test_int4_packing_roundtrip(device)
+    test_int4_residual_vs_oracle(device, B=1)
 
     print("\n=== memory claim (MambaSpec.page_size_bytes equivalent) ===")
     test_memory_claim()
