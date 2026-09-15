@@ -100,12 +100,13 @@ exactly what bf16 costs, the comparison changes completely:
 |---|---|---|---|
 | fp32 | 2.10 MB | 1.00x | — |
 | bf16 | 1.05 MB | 2.00x | 1.00x |
-| int8 + int8 residual + scales | 1.08 MB | **1.94x** | **0.97x** |
+| int8 state + int8 residual + scales | 1.08 MB | 1.94x | **0.97x** |
+| **int8 state + int4 residual + scales** | **0.82 MB** | **2.56x** | **1.28x** |
 
-Against bf16 this scheme is marginally *worse* on memory. The quality result is
-unaffected — INT8 state at bf16-level accuracy is still the contribution — but
-an in-engine memory win needs a cheaper residual (int4, or amortizing one
-residual across steps). See `RESULTS.md` Finding 8.
+With an int8 residual the scheme is 2 B/element — exactly bf16's cost, so
+marginally *worse* than the baseline a real engine runs. Packing the residual to
+int4 (two codes per byte) fixes that: **1.28x against bf16**, measured, at a
+decode error still on the quantization noise floor. See `RESULTS.md` Finding 8.
 
 ### Kernel (fused: Triton and raw CUDA/C++)
 

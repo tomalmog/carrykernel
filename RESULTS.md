@@ -257,7 +257,8 @@ Verified on A10G against the same oracle, plus the engine behaviours the layout
 brings with it: round-half-to-even (124 constructed ties, 60 discriminating
 against `floor(x+0.5)`, zero code differences), `NULL_BLOCK_ID` padding (emits
 zeros, leaves other slots byte-identical), paging isolation (batched ==
-per-request sequential), and decode-vs-oracle at `o rel 1.7e-3 / h rel 5.3e-3`.
+per-request sequential), decode-vs-oracle at `o rel 1.7e-3 / h rel 5.3e-3`, and
+lossless int4 nibble packing.
 
 **And the caveat that matters most.** The ~2x memory claim is against an **FP32**
 state. vLLM's GDN state dtype defaults to the model activation dtype — bf16 for
@@ -268,18 +269,28 @@ bf16 already costs. Bytes per request slot at Qwen3.5 shapes (HV=32, V=K=128):
 |---|---|---|---|
 | fp32 | 2.10 MB | 1.00x | — |
 | bf16 | 1.05 MB | 2.00x | 1.00x |
-| int8 + int8 residual + scales | 1.08 MB | **1.94x** | **0.97x** |
+| int8 state + int8 residual + scales | 1.08 MB | 1.94x | **0.97x** |
+| **int8 state + int4 residual + scales** | **0.82 MB** | **2.56x** | **1.28x** |
 
 So against the baseline a real vLLM deployment actually runs, error-feedback
-INT8 is **marginally worse on memory**, not 2x better. The quality result stands
-on its own (INT8 state at bf16-level accuracy), but a memory win in-engine needs
-a cheaper residual — int4 (2.67x vs FP32, ~1.33x vs bf16), or amortizing one
-residual across several steps. `test_memory_claim` asserts both directions so
-the claim cannot silently drift.
+INT8 with an int8 residual is **marginally worse on memory**, not 2x better:
+`int8 state + int8 residual` is 2 B/element, exactly bf16's cost.
 
-This is why Stage B (wiring into vLLM's cache allocation) is **not** worth doing
-as-is: it would land a change that does not reduce memory against the real
-baseline.
+**The fix is a cheaper residual, and it is implemented and measured.** Packing
+the residual to int4 (two codes per byte along K, nibble select on load, pair
+repack on store) brings the state to 1.5 B/element plus scales — **1.28x against
+bf16**, a real win, and 2.56x against FP32. The quality cost is small: decode
+error against the oracle moves from `o 1.7e-3 / h 5.3e-3` (int8 residual) to
+`o 2.8e-3 / h 6.6e-3` (int4), still at the INT8 quantization noise floor, and
+the project's PPL sweep independently put an int4 residual at +1.6%.
+
+`test_memory_claim` asserts **both** directions — the int8 residual must *not*
+claim a win over bf16, and the int4 residual must — so neither claim can
+silently drift.
+
+The practical conclusion: if this is ever wired into vLLM's cache allocation
+(Stage B), it has to be the int4-residual variant. The int8-residual version
+would land a change that does not reduce memory against the real baseline.
 
 ## Limitations
 

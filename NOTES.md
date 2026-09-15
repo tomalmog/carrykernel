@@ -105,13 +105,20 @@ Layout transpose is FAVOURABLE: BK = next_pow2(K), NK == 1 means one program
 holds a whole [BV, K] tile, so the per-V amax is an in-register contiguous
 row reduction — no multi-pass, unlike the [K, V] CUDA kernel.
 
-**Bytes/slot (HV=32, V=K=128): fp32 2.10 MB | bf16 1.05 MB | int8+EF 1.08 MB.**
-=> 1.94x vs fp32, **0.97x vs bf16**. vLLM's GDN state defaults to the model
-activation dtype (bf16 for Qwen3.5), so against the REAL baseline this scheme is
-break-even-to-slightly-worse on memory. int8 state + int8 residual = 2 B/elem,
-exactly bf16's cost. An in-engine win needs int4 residual (~1.33x vs bf16) or
-amortizing one residual across steps. Stage B (cache wiring) deliberately NOT
-done for this reason.
+**Bytes/slot (HV=32, V=K=128), measured:**
+| representation | bytes/slot | vs fp32 | vs bf16 |
+|---|---|---|---|
+| fp32 | 2.10 MB | 1.00x | — |
+| bf16 | 1.05 MB | 2.00x | 1.00x |
+| int8 state + int8 resid | 1.08 MB | 1.94x | **0.97x** |
+| int8 state + int4 resid | 0.82 MB | 2.56x | **1.28x** |
+
+vLLM's GDN state defaults to the model activation dtype (bf16 for Qwen3.5), so
+against the REAL baseline an int8 residual is break-even-to-worse: int8 state +
+int8 residual = 2 B/elem, exactly bf16's cost. **The int4-packed residual is the
+variant that wins (1.28x vs bf16)** — implemented, nibble packing verified
+lossless, decode error o 2.8e-3 / h 6.6e-3 vs 1.7e-3 / 5.3e-3 for int8.
+Any Stage B cache wiring must use the int4 residual.
 
 ## Bottom line
 Error-feedback recurrent-state quantization rescues INT8 state (GSM8K 41%→81%

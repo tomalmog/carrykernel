@@ -129,6 +129,9 @@ statequant/
 cuda/
   gdn_state_kernel.cu # raw CUDA/C++ port of the same fused op (+ FP32 baseline)
   binding.py          # JIT build (torch.utils.cpp_extension) + Python wrapper
+vllm_integration/
+  quantized_packed_decode.py       # vLLM-layout [V,K] kernel, int8 or int4 residual
+  test_quantized_packed_decode.py  # oracle + paging + NULL_BLOCK_ID + packing tests
 experiments/
   exp1_error_dynamics.py  # compounding vs wash-out (mechanism)
   exp2_bits_sweep.py      # INT-k floor + EF
@@ -214,10 +217,16 @@ python experiments/test_kernel.py
   at 25% less storage.
 - ✅ **vLLM Stage A**: a quantized drop-in for vLLM's vendored GDN decode kernel
   in its own [V,K] layout, correctness-tested (rounding ties, NULL_BLOCK_ID
-  padding, paging isolation, decode-vs-oracle). **Key caveat: the 2x memory
-  claim is vs FP32; vLLM defaults the GDN state to bf16, against which int8
-  state + int8 residual is 0.97x. The int4-residual variant (~1.33x vs bf16) is
-  what actually wins.** See RESULTS.md Finding 8.
+  padding, paging isolation, decode-vs-oracle, int4 nibble packing).
+  **Key caveat, measured: the 2x memory claim is vs FP32. vLLM defaults the GDN
+  state to the model activation dtype (bf16), against which int8 state + int8
+  residual is 0.97x — i.e. slightly worse. The int4-residual variant is 1.28x
+  vs bf16 (2.56x vs fp32) and is the one to use.** See RESULTS.md Finding 8.
+- ⬜ **Stage B (NOT done, deliberately)**: wiring into vLLM's cache allocation
+  (extend `MambaDType`, thread scale+residual through `MambaSpec`, relax
+  `FUSED_GDN_STATE_DTYPES`). Only worth doing with the int4 residual, and note
+  the hard part: the EF residual is per-request persistent state that must
+  survive paging, preemption, prefix-cache reuse and spec-decode rollback.
 
 ## What's left / next steps (in priority order)
 
